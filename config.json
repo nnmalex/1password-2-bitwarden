@@ -1,0 +1,22 @@
+{
+  "vault_mapping": {
+    "Personal": {
+      "destination": "personal",
+      "folder": null,
+      "organization": null,
+      "collection": null
+    },
+    "Work": {
+      "destination": "personal",
+      "folder": "Work",
+      "organization": null,
+      "collection": null
+    },
+    "Shared": {
+      "destination": "organization",
+      "folder": null,
+      "organization": "My Organization",
+      "collection": "Shared Items"
+    }
+  }
+}

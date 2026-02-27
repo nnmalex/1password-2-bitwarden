@@ -1,0 +1,42 @@
+# Exported data (contains secrets!)
+data/export/*
+!data/export/.gitkeep
+
+data/transformed/*
+!data/transformed/.gitkeep
+
+data/attachments/*
+!data/attachments/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Reports (may contain personal info)
+reports/*
+!reports/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.venv/
+venv/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AI
+AGENTS.md
+CLAUDE.md
+GEMINI.md
