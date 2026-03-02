@@ -13,9 +13,13 @@ import json
 import sys
 import re
 import argparse
+import base64
+import hashlib
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, Tuple
 import uuid
 import logging
 
@@ -25,6 +29,307 @@ BW_TYPE_SECURE_NOTE = 2
 BW_TYPE_CARD = 3
 BW_TYPE_IDENTITY = 4
 BW_TYPE_SSH_KEY = 5
+
+
+class SSHKeyProcessor:
+    """Helper class to process and validate SSH keys for Bitwarden compatibility."""
+    
+    # OpenSSH private key headers
+    OPENSSH_PRIVATE_BEGIN = "-----BEGIN OPENSSH PRIVATE KEY-----"
+    OPENSSH_PRIVATE_END = "-----END OPENSSH PRIVATE KEY-----"
+    
+    # Legacy PEM format headers
+    RSA_PRIVATE_BEGIN = "-----BEGIN RSA PRIVATE KEY-----"
+    RSA_PRIVATE_END = "-----END RSA PRIVATE KEY-----"
+    EC_PRIVATE_BEGIN = "-----BEGIN EC PRIVATE KEY-----"
+    EC_PRIVATE_END = "-----END EC PRIVATE KEY-----"
+    PKCS8_PRIVATE_BEGIN = "-----BEGIN PRIVATE KEY-----"
+    PKCS8_PRIVATE_END = "-----END PRIVATE KEY-----"
+    
+    # Public key prefixes for different key types
+    PUBLIC_KEY_PREFIXES = ['ssh-rsa', 'ssh-ed25519', 'ecdsa-sha2-nistp256', 
+                          'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-dss']
+    
+    @classmethod
+    def is_valid_private_key(cls, key: Optional[str]) -> bool:
+        """Check if the provided string is a valid SSH private key."""
+        if not key or not isinstance(key, str):
+            return False
+        
+        key = key.strip()
+        
+        # Check for OpenSSH format
+        if cls.OPENSSH_PRIVATE_BEGIN in key and cls.OPENSSH_PRIVATE_END in key:
+            return True
+        
+        # Check for legacy PEM formats
+        if cls.RSA_PRIVATE_BEGIN in key and cls.RSA_PRIVATE_END in key:
+            return True
+        if cls.EC_PRIVATE_BEGIN in key and cls.EC_PRIVATE_END in key:
+            return True
+        if cls.PKCS8_PRIVATE_BEGIN in key and cls.PKCS8_PRIVATE_END in key:
+            return True
+        
+        return False
+    
+    @classmethod
+    def is_valid_public_key(cls, key: Optional[str]) -> bool:
+        """Check if the provided string is a valid SSH public key."""
+        if not key or not isinstance(key, str):
+            return False
+        
+        key = key.strip()
+        
+        # Check if it starts with a known public key prefix
+        for prefix in cls.PUBLIC_KEY_PREFIXES:
+            if key.startswith(prefix):
+                return True
+        
+        return False
+    
+    @classmethod
+    def normalize_private_key(cls, key: Optional[str]) -> Optional[str]:
+        """Normalize a private key to ensure proper formatting."""
+        if not key:
+            return None
+        
+        key = key.strip()
+        
+        # If it's already a valid private key, ensure proper line endings
+        if cls.is_valid_private_key(key):
+            # Normalize line endings
+            key = key.replace('\r\n', '\n').replace('\r', '\n')
+            return key
+        
+        # Try to wrap raw base64 content in OpenSSH headers
+        # This handles cases where 1Password might export just the key material
+        if cls._looks_like_base64(key):
+            # Try wrapping as OpenSSH format
+            wrapped = f"{cls.OPENSSH_PRIVATE_BEGIN}\n{cls._format_base64(key)}\n{cls.OPENSSH_PRIVATE_END}"
+            return wrapped
+        
+        return None
+    
+    @classmethod
+    def normalize_public_key(cls, key: Optional[str]) -> Optional[str]:
+        """Normalize a public key to ensure proper formatting."""
+        if not key:
+            return None
+        
+        key = key.strip()
+        
+        # Remove any newlines from the public key (should be single line)
+        key = key.replace('\n', '').replace('\r', '')
+        
+        if cls.is_valid_public_key(key):
+            return key
+        
+        return None
+    
+    @classmethod
+    def generate_fingerprint(cls, public_key: Optional[str], private_key: Optional[str] = None) -> Optional[str]:
+        """
+        Generate an SSH key fingerprint from the public key.
+        
+        Returns fingerprint in SHA256:base64 format (e.g., "SHA256:abcd1234...")
+        Falls back to using ssh-keygen if available.
+        """
+        if public_key and cls.is_valid_public_key(public_key):
+            fingerprint = cls._generate_fingerprint_from_public_key(public_key)
+            if fingerprint:
+                return fingerprint
+        
+        # Try using ssh-keygen with the private key
+        if private_key and cls.is_valid_private_key(private_key):
+            fingerprint = cls._generate_fingerprint_via_ssh_keygen(private_key)
+            if fingerprint:
+                return fingerprint
+        
+        return None
+    
+    @classmethod
+    def _generate_fingerprint_from_public_key(cls, public_key: str) -> Optional[str]:
+        """Generate fingerprint directly from public key data."""
+        try:
+            # Parse the public key: format is "type base64data [comment]"
+            parts = public_key.strip().split()
+            if len(parts) < 2:
+                return None
+            
+            key_type = parts[0]
+            key_data = parts[1]
+            
+            # Decode the base64 key data
+            raw_key = base64.b64decode(key_data)
+            
+            # Generate SHA256 hash
+            sha256_hash = hashlib.sha256(raw_key).digest()
+            
+            # Encode as base64 and format
+            fingerprint_b64 = base64.b64encode(sha256_hash).decode('ascii').rstrip('=')
+            
+            return f"SHA256:{fingerprint_b64}"
+        except Exception:
+            return None
+    
+    @classmethod
+    def _generate_fingerprint_via_ssh_keygen(cls, private_key: str) -> Optional[str]:
+        """Generate fingerprint using ssh-keygen command."""
+        try:
+            # Write private key to a temp file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
+                f.write(private_key)
+                temp_path = f.name
+            
+            try:
+                # Use ssh-keygen to get fingerprint
+                result = subprocess.run(
+                    ['ssh-keygen', '-l', '-f', temp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if result.returncode == 0:
+                    # Output format: "256 SHA256:xxxx comment (TYPE)"
+                    output = result.stdout.strip()
+                    parts = output.split()
+                    if len(parts) >= 2:
+                        # Find the SHA256: part
+                        for part in parts:
+                            if part.startswith('SHA256:'):
+                                return part
+            finally:
+                # Clean up temp file
+                Path(temp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        
+        return None
+    
+    @classmethod
+    def extract_public_key_from_private(cls, private_key: str) -> Optional[str]:
+        """Extract public key from a private key using ssh-keygen."""
+        if not cls.is_valid_private_key(private_key):
+            return None
+        
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as f:
+                f.write(private_key)
+                temp_path = f.name
+            
+            try:
+                # Set proper permissions for ssh-keygen
+                Path(temp_path).chmod(0o600)
+                
+                # Extract public key
+                result = subprocess.run(
+                    ['ssh-keygen', '-y', '-f', temp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if result.returncode == 0:
+                    public_key = result.stdout.strip()
+                    if cls.is_valid_public_key(public_key):
+                        return public_key
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        
+        return None
+    
+    @classmethod
+    def _looks_like_base64(cls, s: str) -> bool:
+        """Check if a string looks like base64 encoded data."""
+        # Remove whitespace
+        s = ''.join(s.split())
+        
+        # Check if it's valid base64 characters
+        import re
+        if not re.match(r'^[A-Za-z0-9+/=]+$', s):
+            return False
+        
+        # Should be reasonably long for an SSH key
+        return len(s) > 100
+    
+    @classmethod
+    def _format_base64(cls, data: str, line_length: int = 70) -> str:
+        """Format base64 data with proper line breaks."""
+        # Remove existing whitespace
+        data = ''.join(data.split())
+        
+        # Insert line breaks
+        lines = [data[i:i+line_length] for i in range(0, len(data), line_length)]
+        return '\n'.join(lines)
+    
+    @classmethod
+    def process_ssh_key(cls, private_key: Optional[str], public_key: Optional[str], 
+                       fingerprint: Optional[str], logger: logging.Logger) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Process and validate SSH key data for Bitwarden compatibility.
+        
+        Returns: (normalized_private_key, normalized_public_key, fingerprint)
+        """
+        # Normalize private key
+        normalized_private = cls.normalize_private_key(private_key)
+        if not normalized_private:
+            logger.warning("Could not normalize private key - key may be invalid or in unsupported format")
+        
+        # Normalize public key, or try to extract from private key
+        normalized_public = cls.normalize_public_key(public_key)
+        if not normalized_public and normalized_private:
+            logger.info("Public key missing or invalid, attempting to extract from private key")
+            normalized_public = cls.extract_public_key_from_private(normalized_private)
+            if normalized_public:
+                logger.info("Successfully extracted public key from private key")
+            else:
+                logger.warning("Could not extract public key from private key")
+        
+        # Generate or validate fingerprint
+        if fingerprint:
+            # Normalize fingerprint format
+            if not fingerprint.startswith('SHA256:') and not fingerprint.startswith('MD5:'):
+                # Might be just the hash portion, add SHA256 prefix
+                if len(fingerprint) == 43 or len(fingerprint) == 44:  # Base64 SHA256 length
+                    fingerprint = f"SHA256:{fingerprint}"
+        else:
+            # Generate fingerprint
+            logger.info("Fingerprint missing, attempting to generate")
+            fingerprint = cls.generate_fingerprint(normalized_public, normalized_private)
+            if fingerprint:
+                logger.info(f"Generated fingerprint: {fingerprint}")
+            else:
+                logger.warning("Could not generate fingerprint")
+        
+        return normalized_private, normalized_public, fingerprint
+    
+    @classmethod
+    def validate_ssh_key_for_bitwarden(cls, private_key: Optional[str], public_key: Optional[str], 
+                                       fingerprint: Optional[str]) -> Tuple[bool, List[str]]:
+        """
+        Validate that SSH key data meets Bitwarden requirements.
+        
+        Returns: (is_valid, list_of_issues)
+        """
+        issues = []
+        
+        if not private_key:
+            issues.append("Missing private key")
+        elif not cls.is_valid_private_key(private_key):
+            issues.append("Private key is not in a valid format (OpenSSH or PKCS#8 required)")
+        
+        if not public_key:
+            issues.append("Missing public key")
+        elif not cls.is_valid_public_key(public_key):
+            issues.append("Public key is not in a valid format")
+        
+        if not fingerprint:
+            issues.append("Missing key fingerprint")
+        
+        return len(issues) == 0, issues
 
 # 1Password category to Bitwarden type mapping
 CATEGORY_MAP = {
@@ -88,12 +393,18 @@ class OnePasswordToBitwarden:
         self.org_items: List[Dict] = []
         
         self.attachments: List[Dict] = []  # Track items with attachments
+        self.ssh_key_warnings: List[str] = []  # Track SSH key issues
         self.stats = {
             'total_items': 0,
             'converted': 0,
             'failed': 0,
             'by_vault': {},
-            'by_type': {}
+            'by_type': {},
+            'ssh_keys': {
+                'total': 0,
+                'valid': 0,
+                'with_warnings': 0
+            }
         }
     
     def generate_uuid(self) -> str:
@@ -279,7 +590,17 @@ class OnePasswordToBitwarden:
         elif bw_type == BW_TYPE_SECURE_NOTE:
             bw_item['secureNote'] = {'type': 0}
         elif bw_type == BW_TYPE_SSH_KEY:
-            bw_item['sshKey'] = self.transform_ssh_key(item)
+            ssh_key_data, ssh_warnings = self.transform_ssh_key(item)
+            bw_item['sshKey'] = ssh_key_data
+            
+            # Track SSH key statistics
+            self.stats['ssh_keys']['total'] += 1
+            if ssh_warnings:
+                bw_item['_ssh_key_warnings'] = ssh_warnings
+                self.ssh_key_warnings.extend(ssh_warnings)
+                self.stats['ssh_keys']['with_warnings'] += 1
+            else:
+                self.stats['ssh_keys']['valid'] += 1
         
         # Add custom fields for non-standard fields
         custom_fields = self.extract_custom_fields(item, category)
@@ -305,8 +626,8 @@ class OnePasswordToBitwarden:
                 return field['value']
         return None
     
-    def get_field_value(self, item: Dict, field_id: str = None, purpose: str = None, 
-                        field_type: str = None, label: str = None) -> Optional[str]:
+    def get_field_value(self, item: Dict, field_id: Optional[str] = None, purpose: Optional[str] = None, 
+                        field_type: Optional[str] = None, label: Optional[str] = None) -> Optional[str]:
         """Get a field value by various criteria."""
         fields = item.get('fields', [])
         for field in fields:
@@ -459,28 +780,86 @@ class OnePasswordToBitwarden:
         
         return identity
     
-    def transform_ssh_key(self, item: Dict) -> Dict:
-        """Transform to Bitwarden SSH key type."""
-        ssh_key: Dict[str, Any] = {
-            'privateKey': None,
-            'publicKey': None,
-            'keyFingerprint': None
-        }
+    def transform_ssh_key(self, item: Dict) -> Tuple[Dict, List[str]]:
+        """
+        Transform to Bitwarden SSH key type.
         
+        Bitwarden's SSH Agent requires keys to be in OpenSSH or PKCS#8 format.
+        This method:
+        1. Extracts private key, public key, and fingerprint from 1Password fields
+        2. Validates and normalizes the key format
+        3. Generates missing public key from private key if needed
+        4. Generates fingerprint if missing
+        5. Validates all required fields are present
+        
+        Returns:
+            Tuple of (ssh_key_dict, list_of_warnings)
+        """
+        warnings: List[str] = []
+        
+        # Initialize with None values
+        raw_private_key: Optional[str] = None
+        raw_public_key: Optional[str] = None
+        raw_fingerprint: Optional[str] = None
+        
+        # Extract SSH key fields from 1Password item
         fields = item.get('fields', [])
         for field in fields:
-            field_id = field.get('id', '')
+            field_id = field.get('id', '').lower()
             field_type = field.get('type', '')
+            field_label = field.get('label', '').lower()
             value = field.get('value')
             
-            if field_id == 'private_key' or field_type == 'SSHKEY':
-                ssh_key['privateKey'] = value
-            elif field_id == 'public_key':
-                ssh_key['publicKey'] = value
-            elif field_id == 'fingerprint':
-                ssh_key['keyFingerprint'] = value
+            if not value:
+                continue
+            
+            # Match private key by multiple criteria
+            if (field_id == 'private_key' or 
+                field_id == 'privatekey' or
+                field_type == 'SSHKEY' or
+                'private' in field_label):
+                raw_private_key = value
+            # Match public key
+            elif (field_id == 'public_key' or 
+                  field_id == 'publickey' or
+                  'public' in field_label):
+                raw_public_key = value
+            # Match fingerprint
+            elif (field_id == 'fingerprint' or 
+                  'fingerprint' in field_label):
+                raw_fingerprint = value
         
-        return ssh_key
+        # Process and validate the SSH key data
+        private_key, public_key, fingerprint = SSHKeyProcessor.process_ssh_key(
+            raw_private_key, raw_public_key, raw_fingerprint, self.logger
+        )
+        
+        # Validate the processed key
+        is_valid, issues = SSHKeyProcessor.validate_ssh_key_for_bitwarden(
+            private_key, public_key, fingerprint
+        )
+        
+        if not is_valid:
+            item_title = item.get('title', 'Unknown')
+            for issue in issues:
+                warning = f"SSH key '{item_title}': {issue}"
+                warnings.append(warning)
+                self.logger.warning(warning)
+            
+            # If private key is invalid but we have raw data, include a note
+            if not private_key and raw_private_key:
+                warnings.append(
+                    f"SSH key '{item_title}': Private key exists but is not in OpenSSH/PKCS#8 format. "
+                    "The key may not work with Bitwarden's SSH Agent. Consider manually recreating the key."
+                )
+        
+        ssh_key: Dict[str, Any] = {
+            'privateKey': private_key,
+            'publicKey': public_key,
+            'keyFingerprint': fingerprint
+        }
+        
+        return ssh_key, warnings
     
     def extract_custom_fields(self, item: Dict, category: str) -> List[Dict]:
         """Extract non-standard fields as custom fields."""
@@ -588,9 +967,22 @@ class OnePasswordToBitwarden:
             'collections': len(collections_list),
             'attachments': len(self.attachments),
             'vault_mapping': self.vault_mapping,
+            'ssh_keys': self.stats['ssh_keys'],
+            'ssh_key_warnings': self.ssh_key_warnings,
         }
         with open(self.output_dir / 'summary.json', 'w') as f:
             json.dump(summary, f, indent=2)
+        
+        # Save SSH key warnings to a separate file for easy review
+        if self.ssh_key_warnings:
+            with open(self.output_dir / 'ssh_key_warnings.txt', 'w') as f:
+                f.write("SSH Key Migration Warnings\n")
+                f.write("=" * 50 + "\n\n")
+                f.write("The following SSH keys may not work correctly with Bitwarden's SSH Agent.\n")
+                f.write("Consider manually recreating these keys in Bitwarden after import.\n\n")
+                for warning in self.ssh_key_warnings:
+                    f.write(f"- {warning}\n")
+            self.logger.warning(f"SSH key warnings saved to: {self.output_dir / 'ssh_key_warnings.txt'}")
     
     def print_stats(self):
         """Print transformation statistics."""
@@ -608,6 +1000,22 @@ class OnePasswordToBitwarden:
         self.logger.info("By item type:")
         for item_type, count in sorted(self.stats['by_type'].items()):
             self.logger.info(f"  {item_type}: {count}")
+        
+        # SSH key specific stats
+        ssh_stats = self.stats['ssh_keys']
+        if ssh_stats['total'] > 0:
+            self.logger.info("")
+            self.logger.info("=== SSH Key Migration Summary ===")
+            self.logger.info(f"Total SSH keys: {ssh_stats['total']}")
+            self.logger.info(f"Valid (ready for SSH Agent): {ssh_stats['valid']}")
+            self.logger.info(f"With warnings: {ssh_stats['with_warnings']}")
+            
+            if ssh_stats['with_warnings'] > 0:
+                self.logger.warning("")
+                self.logger.warning("WARNING: Some SSH keys may not work with Bitwarden's SSH Agent!")
+                self.logger.warning("These keys require proper OpenSSH or PKCS#8 format to function.")
+                self.logger.warning("Keys with issues may need to be manually recreated in Bitwarden.")
+                self.logger.warning(f"See ssh_key_warnings.txt for details.")
 
 
 def main():
