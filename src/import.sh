@@ -34,8 +34,8 @@ if [ -z "$BW_SESSION" ]; then
 fi
 
 # Verify transformed data exists
-if [ ! -f "$TRANSFORMED_DIR/bitwarden_import.json" ]; then
-    log "ERROR: Transformed data not found at $TRANSFORMED_DIR/bitwarden_import.json"
+if [ ! -f "$TRANSFORMED_DIR/bitwarden_personal_import.json" ]; then
+    log "ERROR: Transformed data not found at $TRANSFORMED_DIR/bitwarden_personal_import.json"
     log "Please run transform.py first"
     exit 1
 fi
@@ -56,7 +56,7 @@ if [ "$IMPORT_METHOD" = "bulk" ]; then
     
     # Use Bitwarden's import command with JSON format
     log "Importing from bitwarden_import.json..."
-    bw import bitwardenjson "$TRANSFORMED_DIR/bitwarden_import.json" 2>&1 | tee -a "$LOG_FILE"
+    bw import bitwardenjson "$TRANSFORMED_DIR/bitwarden_personal_import.json" 2>&1 | tee -a "$LOG_FILE"
     
 elif [ "$IMPORT_METHOD" = "individual" ]; then
     log "Using individual item import method..."
