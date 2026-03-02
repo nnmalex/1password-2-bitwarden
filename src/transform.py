@@ -814,18 +814,26 @@ class OnePasswordToBitwarden:
                 continue
             
             # Match private key by multiple criteria
-            if (field_id == 'private_key' or 
+            if (field_id == 'private_key' or
                 field_id == 'privatekey' or
                 field_type == 'SSHKEY' or
-                'private' in field_label):
-                raw_private_key = value
-            # Match public key
-            elif (field_id == 'public_key' or 
+                'private key' in field_label):
+                # Prefer OpenSSH format from ssh_formats if available
+                # (Bitwarden SSH Agent requires OpenSSH format, not PKCS#8)
+                ssh_formats = field.get('ssh_formats', {})
+                openssh_data = ssh_formats.get('openssh', {})
+                if openssh_data.get('value'):
+                    raw_private_key = openssh_data['value']
+                else:
+                    raw_private_key = value
+            # Match public key (use 'public key' not 'public' to avoid
+            # matching unrelated fields like 'public url')
+            elif (field_id == 'public_key' or
                   field_id == 'publickey' or
-                  'public' in field_label):
+                  'public key' in field_label):
                 raw_public_key = value
             # Match fingerprint
-            elif (field_id == 'fingerprint' or 
+            elif (field_id == 'fingerprint' or
                   'fingerprint' in field_label):
                 raw_fingerprint = value
         
