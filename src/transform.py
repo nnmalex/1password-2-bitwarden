@@ -23,6 +23,110 @@ from typing import Any, Optional, Dict, List, Tuple
 import uuid
 import logging
 
+class ExportFileError(Exception):
+    """Raised when an export/config JSON file cannot be read or parsed.
+
+    Carries enough structured context (path, position, sanitized byte window)
+    for a user to diagnose encoding/structural issues without us ever logging
+    secret values from the file.
+    """
+
+    def __init__(self, message: str, path: Path,
+                 lineno: Optional[int] = None, colno: Optional[int] = None,
+                 pos: Optional[int] = None, window: Optional[str] = None):
+        super().__init__(message)
+        self.path = path
+        self.lineno = lineno
+        self.colno = colno
+        self.pos = pos
+        self.window = window
+
+
+_JSON_STRUCTURAL = set(b'{}[],:"')
+_WHITESPACE_REPR = {0x20: ' ', 0x09: '\\t', 0x0a: '\\n', 0x0d: '\\r'}
+
+
+def _safe_byte_window(data: bytes, pos: int, radius: int = 32) -> str:
+    """Render bytes around `pos` with secret values redacted.
+
+    Printable ASCII letters/digits/symbols (anything that could be part of a
+    password, token, or key) are replaced with '.'. JSON-structural characters,
+    whitespace, and non-ASCII/control bytes are preserved (the latter shown as
+    \\xHH) so BOMs, smart quotes, stray nulls, and brace/quote errors remain
+    diagnosable.
+    """
+    start = max(0, pos - radius)
+    end = min(len(data), pos + radius)
+    tokens: List[str] = []
+    caret_col = 0
+    for i in range(start, end):
+        b = data[i]
+        if b in _WHITESPACE_REPR:
+            tok = _WHITESPACE_REPR[b]
+        elif b in _JSON_STRUCTURAL:
+            tok = chr(b)
+        elif 0x21 <= b <= 0x7e:
+            tok = '.'
+        else:
+            tok = f'\\x{b:02x}'
+        tokens.append(tok)
+        if i < pos:
+            caret_col += len(tok)
+    line = ''.join(tokens)
+    prefix = '... ' if start > 0 else ''
+    suffix = ' ...' if end < len(data) else ''
+    caret_line = ' ' * (len(prefix) + caret_col) + '^'
+    return f"{prefix}{line}{suffix}\n{caret_line}"
+
+
+def load_json_safely(path: Path, logger: Optional[logging.Logger] = None) -> Any:
+    """Load a JSON file, raising ExportFileError with rich, secret-safe context.
+
+    Transparently strips a UTF-8 BOM via utf-8-sig, which is the most common
+    cause of "line 1 column 1" / "line N column 1" decode errors on exports
+    produced under Windows locales.
+    """
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raise ExportFileError(f"File not found: {path}", path=path)
+    except PermissionError as e:
+        raise ExportFileError(f"Permission denied reading {path}: {e}", path=path)
+    except OSError as e:
+        raise ExportFileError(f"Could not read {path}: {e}", path=path)
+
+    size = len(raw)
+
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError as e:
+        window = _safe_byte_window(raw, e.start)
+        msg = (
+            f"Encoding error in {path} (size {size} bytes)\n"
+            f"  Not valid UTF-8 at byte offset {e.start}: {e.reason}\n"
+            f"  Byte context (values redacted, non-ASCII shown as \\xHH):\n"
+            f"    {window}"
+        )
+        raise ExportFileError(msg, path=path, pos=e.start, window=window)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        window = _safe_byte_window(raw, e.pos)
+        msg = (
+            f"JSON parse error in {path} (size {size} bytes)\n"
+            f"  {e.msg} at line {e.lineno} column {e.colno} (char {e.pos})\n"
+            f"  Byte context (values redacted, non-ASCII shown as \\xHH):\n"
+            f"    {window}\n"
+            f"  Common causes: BOM (\\xef\\xbb\\xbf), smart quotes "
+            f"(\\xe2\\x80\\x9c/\\x9d), stray control bytes, or a truncated export."
+        )
+        raise ExportFileError(
+            msg, path=path,
+            lineno=e.lineno, colno=e.colno, pos=e.pos, window=window,
+        )
+
+
 # Bitwarden item types
 BW_TYPE_LOGIN = 1
 BW_TYPE_SECURE_NOTE = 2
@@ -365,9 +469,8 @@ def load_config(config_path: Path) -> Dict:
             "Please create config.json with your vault mapping. See README.md for examples."
         )
     
-    with open(config_path) as f:
-        config = json.load(f)
-    
+    config = load_json_safely(config_path)
+
     if 'vault_mapping' not in config:
         raise ValueError("config.json must contain 'vault_mapping' key")
     
@@ -421,8 +524,7 @@ class OnePasswordToBitwarden:
             self.logger.error(f"Vaults file not found: {vaults_file}")
             return False
         
-        with open(vaults_file) as f:
-            vaults = json.load(f)
+        vaults = load_json_safely(vaults_file, self.logger)
         
         # Build vault name mapping
         for vault in vaults:
@@ -496,8 +598,7 @@ class OnePasswordToBitwarden:
             self.logger.warning(f"Items file not found: {items_file}")
             return
         
-        with open(items_file) as f:
-            items_list = json.load(f)
+        items_list = load_json_safely(items_file, self.logger)
         
         # Initialize vault stats
         self.stats['by_vault'][vault_name] = {'total': 0, 'converted': 0, 'failed': 0}
@@ -512,9 +613,8 @@ class OnePasswordToBitwarden:
                 continue
             
             try:
-                with open(item_file) as f:
-                    item = json.load(f)
-                
+                item = load_json_safely(item_file, self.logger)
+
                 self.stats['total_items'] += 1
                 self.stats['by_vault'][vault_name]['total'] += 1
                 
@@ -537,8 +637,12 @@ class OnePasswordToBitwarden:
                     self.stats['failed'] += 1
                     self.stats['by_vault'][vault_name]['failed'] += 1
                     
+            except ExportFileError as e:
+                self.logger.error(f"Failed to read item file {item_file}:\n{e}")
+                self.stats['failed'] += 1
+                self.stats['by_vault'][vault_name]['failed'] += 1
             except Exception as e:
-                self.logger.error(f"Failed to transform item {item_id}: {e}")
+                self.logger.error(f"Failed to transform item {item_id} at {item_file}: {e}")
                 self.stats['failed'] += 1
                 self.stats['by_vault'][vault_name]['failed'] += 1
     
@@ -1067,17 +1171,26 @@ def main():
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
         sys.exit(1)
-    
+    except ExportFileError as e:
+        logger.error(f"Could not load config:\n{e}")
+        sys.exit(1)
+
     # Check if export exists
     if not export_dir.exists():
         logger.error(f"Export directory not found: {export_dir}")
         logger.error("Please run export.sh first")
         sys.exit(1)
-    
+
     # Run transformation
     transformer = OnePasswordToBitwarden(export_dir, output_dir, vault_mapping, logger)
-    
-    if transformer.transform_all():
+
+    try:
+        ok = transformer.transform_all()
+    except ExportFileError as e:
+        logger.error(f"Export data could not be read:\n{e}")
+        sys.exit(1)
+
+    if ok:
         logger.info("")
         logger.info("Transformation complete!")
         logger.info(f"Output saved to: {output_dir}")
